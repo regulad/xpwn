@@ -4,6 +4,19 @@
 #include <xpwn/img3.h>
 #include <xpwn/libxpwn.h>
 
+/* Extra slack allocated past the logical length of any IMG3 element buffer
+ * that gets AES-CBC encrypted/decrypted in place (see setKeyImg3/closeImg3).
+ * This code was originally written against real OpenSSL's AES_cbc_encrypt,
+ * which touches exactly the requested number of bytes; wolfSSL's optimized
+ * decrypt path (used when building against wolfSSL's OpenSSL-compat shim
+ * instead) can read/write a few bytes past that for performance, confirmed
+ * directly with valgrind against a real Apple TV 3,2 kernelcache DATA tag.
+ * One AES block (16 bytes) of headroom is comfortably more than the ~11
+ * bytes actually observed. This only pads the malloc; every dataSize/size
+ * field, and therefore the on-disk IMG3 format this code produces, is
+ * completely unaffected. */
+#define IMG3_AES_OVERREAD_PAD 16
+
 static const uint8_t x24kpwn_overflow_data[] = {
   0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0xac, 0x05, 0x81, 0x12,
   0x00, 0x00, 0x01, 0x02, 0x03, 0x01, 0x0a, 0x06, 0x00, 0x02, 0x00, 0x00,
@@ -198,7 +211,14 @@ size_t writeImg3(AbstractFile* file, const void* data, size_t len) {
 		if(info->data->header->size % 0x4 != 0) {
 			info->data->header->size += 0x4 - (info->data->header->size % 0x4);
 		}
-		info->data->data = realloc(info->data->data, info->data->header->dataSize);
+		/* +IMG3_AES_OVERREAD_PAD: see the macro's own comment above -- this
+		   buffer is what closeImg3()'s AES_cbc_encrypt() runs over in
+		   place once writing finishes. realloc() doesn't zero new memory
+		   the way calloc() does elsewhere in this file, so the pad bytes
+		   are zeroed explicitly here instead -- same "AES lookahead reads
+		   this, don't leave it uninitialized" reasoning. */
+		info->data->data = realloc(info->data->data, info->data->header->dataSize + IMG3_AES_OVERREAD_PAD);
+		memset((uint8_t*)info->data->data + info->data->header->dataSize, 0, IMG3_AES_OVERREAD_PAD);
 	}
 	
 	memcpy((void*)((uint8_t*)info->data->data + (uint32_t)info->offset), data, len);
@@ -484,7 +504,19 @@ Img3Element* readImg3Element(AbstractFile* file) {
 			break;
 
 		case IMG3_KBAG_MAGIC:
-			toReturn->data = (unsigned char*) malloc(header->dataSize);
+			/* +IMG3_AES_OVERREAD_PAD: see the comment on that macro below --
+			   this buffer gets AES-CBC'd in place (setKeyImg3/closeImg3) and
+			   wolfSSL's optimized decrypt path can touch a few bytes past
+			   the logical length even though it never touches more than it
+			   reads (dataSize itself is untouched, this only pads the
+			   underlying allocation). */
+			/* calloc, not malloc: the pad bytes are genuine AES lookahead
+			   reads (confirmed via valgrind), not just a safety margin
+			   that's never touched -- left uninitialized they're harmless
+			   (never incorporated into the real dataSize-bounded output)
+			   but still flag as "use of uninitialised value" under
+			   valgrind. */
+			toReturn->data = (unsigned char*) calloc(1, header->dataSize + IMG3_AES_OVERREAD_PAD);
 			toReturn->write = writeImg3KBAG;
 			toReturn->free = freeImg3Default;
 			file->read(file, toReturn->data, header->dataSize);
@@ -492,7 +524,29 @@ Img3Element* readImg3Element(AbstractFile* file) {
 			break;
 
 		default:
-			toReturn->data = (unsigned char*) malloc(header->dataSize);
+			/* +IMG3_AES_OVERREAD_PAD: see above -- this is the actual DATA
+			   tag, the one that's genuinely encrypted/decrypted in place.
+			   Confirmed necessary directly: valgrind's memcheck caught
+			   wolfSSL's wc_AesCbcDecrypt (via wolfSSL_AES_cbc_encrypt, via
+			   setKeyImg3) reading/writing up to ~11 bytes past the end of
+			   this exact allocation while decrypting a real (odd-length,
+			   non-16-aligned dataSize) Apple TV 3,2 kernelcache DATA tag --
+			   never hit by iBSS/iBEC (both small enough / laid out
+			   differently that the overrun's target address happened to
+			   land inside other live heap data instead of unmapped/
+			   redzone memory), but real and reproducible here regardless.
+			   Padding the allocation is the standard, minimal fix for a
+			   crypto routine's fixed-size lookahead/prefetch reading past
+			   a nominal buffer length -- it does not change dataSize, the
+			   on-disk IMG3 format, or anything else about this element;
+			   only the amount of slack after it in memory. */
+			/* calloc, not malloc: the pad bytes are genuine AES lookahead
+			   reads (confirmed via valgrind), not just a safety margin
+			   that's never touched -- left uninitialized they're harmless
+			   (never incorporated into the real dataSize-bounded output)
+			   but still flag as "use of uninitialised value" under
+			   valgrind. */
+			toReturn->data = (unsigned char*) calloc(1, header->dataSize + IMG3_AES_OVERREAD_PAD);
 			toReturn->write = writeImg3Default;
 			toReturn->free = freeImg3Default;
 			file->read(file, toReturn->data, header->dataSize);

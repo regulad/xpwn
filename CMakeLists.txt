@@ -24,7 +24,12 @@ add_subdirectory (ipsw-patch)
 add_subdirectory (dfu-util)
 add_subdirectory (xpwn)
 add_subdirectory (idevice)
-add_subdirectory (pwnmetheus2)
+# pwnmetheus2 hard-requires the legacy libusb-0.1 API (<usb.h>) on non-Windows,
+# non-Apple platforms; libusb-compat is not installed and this GUI pairing
+# helper is unrelated to Blackb0x, which already talks to devices via
+# libirecovery/libimobiledevice against libusb-1.0. Disabled for the Linux
+# port build (blackb0x-linux-port).
+# add_subdirectory (pwnmetheus2)
 add_subdirectory (dripwn)
 
 install(FILES README.markdown DESTINATION . RENAME README.txt)
