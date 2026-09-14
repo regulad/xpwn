@@ -30,10 +30,15 @@ ENDIF(OPENSSL_FOUND)
 
 target_link_libraries(dmg common hfs z)
 
-add_executable(dmg-bin dmg.c)
-target_link_libraries (dmg-bin dmg)
+# dmg-bin (extract/build/build2048/res/iso/dmg conversion) duplicates what
+# macOS's own native `hdiutil` already does -- skip building it there; the
+# `dmg` library above (what this project actually links) is unaffected.
+IF(NOT APPLE)
+	add_executable(dmg-bin dmg.c)
+	target_link_libraries (dmg-bin dmg)
 
-set_target_properties(dmg-bin PROPERTIES OUTPUT_NAME "dmg")
+	set_target_properties(dmg-bin PROPERTIES OUTPUT_NAME "dmg")
 
-install(TARGETS dmg-bin DESTINATION .)
+	install(TARGETS dmg-bin DESTINATION .)
+ENDIF(NOT APPLE)
 
