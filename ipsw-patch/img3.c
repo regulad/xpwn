@@ -206,19 +206,33 @@ size_t writeImg3(AbstractFile* file, const void* data, size_t len) {
 	Img3Info* info = (Img3Info*) file->data;
 
 	while((info->offset + (size_t)len) > info->data->header->dataSize) {
+		size_t alignedBody;
 		info->data->header->dataSize = info->offset + (size_t)len;
-		info->data->header->size = info->data->header->dataSize + sizeof(AppleImg3Header);
-		if(info->data->header->size % 0x4 != 0) {
-			info->data->header->size += 0x4 - (info->data->header->size % 0x4);
-		}
-		/* +IMG3_AES_OVERREAD_PAD: see the macro's own comment above -- this
-		   buffer is what closeImg3()'s AES_cbc_encrypt() runs over in
-		   place once writing finishes. realloc() doesn't zero new memory
-		   the way calloc() does elsewhere in this file, so the pad bytes
-		   are zeroed explicitly here instead -- same "AES lookahead reads
-		   this, don't leave it uninitialized" reasoning. */
-		info->data->data = realloc(info->data->data, info->data->header->dataSize + IMG3_AES_OVERREAD_PAD);
-		memset((uint8_t*)info->data->data + info->data->header->dataSize, 0, IMG3_AES_OVERREAD_PAD);
+		/* 16-align the DATA element's AES body, matching Apple's own IMG3
+		   layout. Verified empirically across 108 DATA elements (27 IPSWs,
+		   10 devices, iOS 4.x-10.x): (totalLength - sizeof(AppleImg3Header))
+		   -- the region AES-CBC runs over -- is ALWAYS a multiple of 16,
+		   while dataSize stays the true (usually not-16-aligned) payload
+		   length. iBoot mis-handles a DATA element that ends in a partial
+		   final AES block (it decodes the kernelcache's complzss stream
+		   short and rejects it), which is exactly what happened once xpwn
+		   PR #7 replaced this 16-alignment with 4-alignment. (dataSize + 15)
+		   / 16 * 16 is a true ceiling: it adds nothing when dataSize is
+		   already 16-aligned -- so iBSS/iBEC output is byte-for-byte
+		   unchanged and PR #7's "no stray 16 bytes" goal is still met -- and
+		   rounds up only when it isn't, i.e. for the kernelcache. See
+		   docs/HISTORY.md. */
+		alignedBody = ((info->data->header->dataSize + 15) / 16) * 16;
+		info->data->header->size = alignedBody + sizeof(AppleImg3Header);
+		/* Allocate the full 16-aligned body plus IMG3_AES_OVERREAD_PAD (see
+		   the macro's comment above -- closeImg3()'s in-place AES_cbc_encrypt
+		   can read a few bytes past the length wolfSSL is asked for). Zero
+		   everything past the true dataSize: both the 16-align pad (which is
+		   encrypted as part of the body and written to disk, so it must be
+		   deterministic) and the over-read slack. */
+		info->data->data = realloc(info->data->data, alignedBody + IMG3_AES_OVERREAD_PAD);
+		memset((uint8_t*)info->data->data + info->data->header->dataSize, 0,
+		       (alignedBody - info->data->header->dataSize) + IMG3_AES_OVERREAD_PAD);
 	}
 	
 	memcpy((void*)((uint8_t*)info->data->data + (uint32_t)info->offset), data, len);
@@ -252,7 +266,14 @@ void closeImg3(AbstractFile* file) {
 		if(info->encrypted) {
 			uint8_t ivec[16];
 			memcpy(ivec, info->iv, 16);
-			AES_cbc_encrypt(info->data->data, info->data->data, (info->data->header->dataSize / 16) * 16, &(info->encryptKey), ivec, AES_ENCRYPT);
+			/* Encrypt the WHOLE 16-aligned element body, not floor(dataSize).
+			   writeImg3()'s grow path now pads the body to a 16-byte multiple
+			   (matching Apple), and (size - sizeof(AppleImg3Header)) is that
+			   aligned length, so this covers every byte of the payload plus
+			   the zeroed 16-align pad -- no partial final block, no plaintext
+			   tail. setKeyImg3()'s decrypt already uses this same length, so
+			   the round-trip stays symmetric. See docs/HISTORY.md. */
+			AES_cbc_encrypt(info->data->data, info->data->data, ((info->data->header->size - sizeof(AppleImg3Header)) / 16) * 16, &(info->encryptKey), ivec, AES_ENCRYPT);
 		}
 
 		if(info->exploit24k) {
@@ -406,14 +427,30 @@ void writeImg3Root(AbstractFile* file, Img3Element* element, Img3Info* info) {
 }
 
 void writeImg3Default(AbstractFile* file, Img3Element* element, Img3Info* info) {
-    
-    size_t paddingSize = (element->header->size - sizeof(AppleImg3Header)) - element->header->dataSize;
-    char zeros[paddingSize];
-    
+
+    size_t bodySize = element->header->size - sizeof(AppleImg3Header);
+    size_t paddingSize = bodySize - element->header->dataSize;
+
+    /* The encrypted DATA element's 16-align padding is part of the AES-CBC
+       body: writeImg3() zeroed it and closeImg3() encrypted it in place, so
+       its ciphertext lives in element->data just past dataSize. Emitting
+       fresh zeros there instead would replace the tail of the final cipher
+       block and corrupt the last real bytes on decrypt -- so for that element
+       write the whole (encrypted) body straight from the buffer, which is
+       sized to hold it. Every OTHER element's buffer holds only dataSize
+       bytes (it was read from the template), so those keep the zero-fill.
+       When dataSize is already 16-aligned (iBSS/iBEC) paddingSize is 0 and
+       both paths behave identically. See docs/HISTORY.md. */
+    if(info && element == info->data && info->encrypted && paddingSize > 0) {
+        file->write(file, element->data, bodySize);
+        return;
+    }
+
 	file->write(file, element->data, element->header->dataSize);
-    
+
     if(paddingSize > 0)
     {
+        char zeros[paddingSize];
         memset(zeros, 0, paddingSize);
 		file->write(file, zeros, paddingSize);
     }
