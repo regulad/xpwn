@@ -583,10 +583,50 @@ Img3Element* readImg3Element(AbstractFile* file) {
 			   (never incorporated into the real dataSize-bounded output)
 			   but still flag as "use of uninitialised value" under
 			   valgrind. */
-			toReturn->data = (unsigned char*) calloc(1, header->dataSize + IMG3_AES_OVERREAD_PAD);
-			toReturn->write = writeImg3Default;
-			toReturn->free = freeImg3Default;
-			file->read(file, toReturn->data, header->dataSize);
+			/* Read the WHOLE element body (size - 12), not just dataSize.
+			   This is the read-side half of the 16-alignment fix below.
+
+			   Apple always 16-aligns the encrypted DATA element's AES body
+			   while leaving dataSize as the true, usually-not-16-aligned
+			   length, so for a kernelcache the body runs a few bytes past
+			   dataSize. setKeyImg3() duly AES-CBC-decrypts
+			   ((size - 12) / 16) * 16 bytes -- the full aligned body -- but
+			   this read only ever filled the first dataSize of them. The
+			   remainder stayed as the calloc's zeros instead of the real
+			   ciphertext, so the final cipher block decrypted to garbage,
+			   the LZSS stream ended inside that garbage, and complzss
+			   stopped short of its declared length:
+			   createAbstractFileFromComp() then refused the image with
+			   "cannot open infile".
+
+			   The distribution of failures is the proof. A build only
+			   breaks when real compressed bytes land in that corrupted
+			   block, so dataSize % 16 == 0 always decoded, % 16 == 1 was a
+			   coin flip (AppleTV3,2 10B329a is the survivor -- one real
+			   byte in the bad block, and the decoder had already emitted
+			   its last output, which is the whole reason this went
+			   unnoticed), and % 16 >= 2 always failed. Reading the full
+			   body flips 66 of the project's 101 (device, build) tuples
+			   from failure to success with no regressions, and leaves the
+			   10B329a output byte-for-byte the length it already was.
+
+			   Harmless for the unencrypted elements that also land here
+			   (TYPE/SEPO/SHSH/CERT): their body is merely 4-aligned
+			   padding, writeImg3Default() still emits dataSize real bytes
+			   plus zeros, and reading the padding changes nothing. The
+			   guard is for a malformed img3 whose size undercuts its own
+			   dataSize -- never trust a header into a negative length. */
+			{
+				unsigned int bodySize = (header->size > sizeof(AppleImg3Header))
+					? (header->size - sizeof(AppleImg3Header)) : 0;
+				if(bodySize < header->dataSize)
+					bodySize = header->dataSize;
+
+				toReturn->data = (unsigned char*) calloc(1, bodySize + IMG3_AES_OVERREAD_PAD);
+				toReturn->write = writeImg3Default;
+				toReturn->free = freeImg3Default;
+				file->read(file, toReturn->data, bodySize);
+			}
 	}
 
 	file->seek(file, curPos + toReturn->header->size);
