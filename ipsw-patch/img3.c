@@ -398,10 +398,13 @@ void writeImg3Root(AbstractFile* file, Img3Element* element, Img3Info* info) {
 
 	header = (AppleImg3RootHeader*) element->header;
 
+	int haveSHSH = 0;
+
 	current = (Img3Element*) element->data;
 	while(current != NULL) {
 		if(current->header->magic == IMG3_SHSH_MAGIC) {
 			header->extra.shshOffset = (uint32_t)(file->tell(file) - sizeof(AppleImg3RootHeader));
+			haveSHSH = 1;
 		}
 
 		if(current->header->magic != IMG3_KBAG_MAGIC || info->encrypted)
@@ -414,6 +417,34 @@ void writeImg3Root(AbstractFile* file, Img3Element* element, Img3Info* info) {
 
 	header->base.dataSize = file->tell(file) - (curPos + sizeof(AppleImg3RootHeader));
 	header->base.size = sizeof(AppleImg3RootHeader) + header->base.dataSize;
+
+	/* No SHSH element means there is nothing for shshOffset to point AT, and the
+	   value still sitting in `header` came from the TEMPLATE -- it was read off
+	   the stock input and is meaningless the moment the payload changes size.
+
+	   That field is `sigCheckArea` in iBoot's reading of the root header, and
+	   iBoot's img3 parser rejects the image outright when
+	   `sigCheckArea > sizeNoPack`. Verified on a real AppleTV3,2 12H1006 iBEC:
+	   the gate at 0x9ff18288 tests `sizeNoPack <= len-20 && sigCheckArea <=
+	   sizeNoPack` and returns error 0x16 (malformed) before ANY signature,
+	   ticket or KBAG logic runs -- which is why no amount of iBoot32Patcher
+	   bypassing helps, and why the failure surfaces as the generic
+	   "Kernelcache image not valid".
+
+	   So every unsigned IMG3 we repack SMALLER than stock was being rejected.
+	   A signed one was fine because the loop above recomputes shshOffset when it
+	   writes the SHSH element, and one repacked LARGER passed while carrying a
+	   silently wrong field -- the same self-consistent-but-wrong shape as this
+	   file's two DATA-alignment bugs. The patched 10B329a kernelcache (signed)
+	   booted; the patched 12H1006 one (unsigned, 112 bytes smaller) did not.
+
+	   Apple ships unsigned IMG3s with sigCheckArea == sizeNoPack -- checked
+	   across all eight stock 12H1006 images (iBSS, iBEC, iBoot, LLB, DeviceTree,
+	   applelogo, ramdisk, kernelcache). Match that. Must run AFTER dataSize is
+	   recomputed above, since it consumes the new value. */
+	if(!haveSHSH) {
+		header->extra.shshOffset = header->base.dataSize;
+	}
 
 	file->seek(file, curPos);
 
